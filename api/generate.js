@@ -1,183 +1,216 @@
-// api/generate.js
-// Vercel Serverless Function - ruleaza server-side, fara CORS, fara limitari browser
-
 const https = require("https");
 const http = require("http");
 
-// Fetch simplu server-side (nu are restrictii CORS ca browserul)
-function fetchUrl(url, headers = {}) {
+// Fetch cu headers de browser real
+function fetchUrl(url, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith("https") ? https : http;
-    const req = lib.get(url, {
+    const options = {
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Cache-Control": "no-cache",
-        ...headers
+        "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+        ...extraHeaders
       },
-      timeout: 15000
-    }, (res) => {
-      // Urmareste redirect-uri
+      timeout: 20000
+    };
+
+    const req = lib.get(url, options, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return fetchUrl(res.headers.location, headers).then(resolve).catch(reject);
+        const redirect = res.headers.location.startsWith("http")
+          ? res.headers.location
+          : `https://www.aliexpress.com${res.headers.location}`;
+        return fetchUrl(redirect, extraHeaders).then(resolve).catch(reject);
       }
 
       const chunks = [];
-      const encoding = res.headers["content-encoding"];
+      const enc = res.headers["content-encoding"];
 
-      if (encoding === "gzip" || encoding === "br" || encoding === "deflate") {
+      const processChunks = () => resolve(Buffer.concat(chunks).toString("utf8"));
+
+      if (enc === "gzip") {
         const zlib = require("zlib");
-        let decompress;
-        if (encoding === "gzip") decompress = zlib.createGunzip();
-        else if (encoding === "br") decompress = zlib.createBrotliDecompress();
-        else decompress = zlib.createInflate();
-        res.pipe(decompress);
-        decompress.on("data", c => chunks.push(c));
-        decompress.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-        decompress.on("error", reject);
+        const gunzip = zlib.createGunzip();
+        res.pipe(gunzip);
+        gunzip.on("data", c => chunks.push(c));
+        gunzip.on("end", processChunks);
+        gunzip.on("error", reject);
+      } else if (enc === "br") {
+        const zlib = require("zlib");
+        const brotli = zlib.createBrotliDecompress();
+        res.pipe(brotli);
+        brotli.on("data", c => chunks.push(c));
+        brotli.on("end", processChunks);
+        brotli.on("error", reject);
       } else {
         res.on("data", c => chunks.push(c));
-        res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+        res.on("end", processChunks);
       }
     });
+
     req.on("error", reject);
     req.on("timeout", () => { req.destroy(); reject(new Error("Timeout")); });
   });
 }
 
-// Extrage imaginile din HTML-ul AliExpress
-function extractAliExpressImages(html) {
+// Extrage imagini din HTML AliExpress
+function extractImages(html) {
   const images = new Set();
 
-  // Metoda 1: JSON-ul de date din pagina (window.runParams sau __NEXT_DATA__)
-  const dataPatterns = [
-    /imagePathList["'\s]*:["'\s]*(\[.*?\])/gs,
-    /"imageUrl["'\s]*:["'\s]*"(https:\/\/ae\d*\.alicdn\.com[^"]+)"/g,
-    /"image["'\s]*:["'\s]*"(https:\/\/ae\d*\.alicdn\.com[^"]+)"/g,
-    /https:\/\/ae\d*\.alicdn\.com\/kf\/[A-Za-z0-9_\-]+\.(jpg|jpeg|png|webp)/gi,
-    /https:\/\/ae01\.alicdn\.com\/kf\/[^"'\s)]+/gi,
-    /https:\/\/ae02\.alicdn\.com\/kf\/[^"'\s)]+/gi,
-    /https:\/\/ae03\.alicdn\.com\/kf\/[^"'\s)]+/gi,
+  // Metoda 1: JSON embedded in pagina - cel mai fiabil
+  try {
+    const jsonMatch = html.match(/window\.runParams\s*=\s*(\{.+?\});\s*\n/s) ||
+                      html.match(/"imagePathList"\s*:\s*(\[.*?\])/s) ||
+                      html.match(/skuImageList['"]\s*:\s*(\[.*?\])/s);
+    if (jsonMatch) {
+      const urls = jsonMatch[1].match(/https:\/\/ae\d*\.alicdn\.com\/kf\/[^"'\\]+\.(jpg|jpeg|png|webp)/gi);
+      if (urls) urls.forEach(u => images.add(u.split("_")[0] + ".jpg"));
+    }
+  } catch(e) {}
+
+  // Metoda 2: Toate URL-urile alicdn din HTML
+  const patterns = [
+    /https:\/\/ae\d+\.alicdn\.com\/kf\/[A-Za-z0-9_\-]+\.(jpg|jpeg|png|webp)/gi,
+    /https:\/\/ae01\.alicdn\.com\/kf\/[^"'\s<>]+/gi,
+    /https:\/\/ae02\.alicdn\.com\/kf\/[^"'\s<>]+/gi,
+    /https:\/\/ae03\.alicdn\.com\/kf\/[^"'\s<>]+/gi,
+    /https:\/\/img\.alicdn\.com\/imgextra\/[^"'\s<>]+/gi,
   ];
 
-  for (const pattern of dataPatterns) {
-    let match;
-    const regex = new RegExp(pattern.source, pattern.flags);
-    while ((match = regex.exec(html)) !== null) {
-      const url = match[1] || match[0];
-      if (url && url.startsWith("http")) {
-        // Curata URL-ul si seteaza rezolutia mare
-        const clean = url
-          .replace(/\\u002F/g, "/")
-          .replace(/\\/g, "")
-          .replace(/_\d+x\d+\.jpg/, "_800x800.jpg")
-          .replace(/\.jpg_\d+x\d+/, ".jpg")
-          .split(".jpg")[0] + ".jpg";
-        if (clean.includes("alicdn.com") && clean.length > 40) {
-          images.add(clean);
-        }
+  for (const pattern of patterns) {
+    const matches = html.match(pattern) || [];
+    matches.forEach(url => {
+      // Curata URL si seteaza rezolutie mare
+      const clean = url
+        .replace(/\\u002F/g, "/")
+        .replace(/\\/g, "")
+        .split(/['"<>\s]/)[0]
+        .replace(/_\d+x\d+[qQ]?\d*\.(jpg|jpeg|png|webp)$/i, ".jpg")
+        .replace(/\.(jpg|jpeg|png|webp)_.+$/i, ".jpg");
+      if (clean.startsWith("https://") && clean.length > 50) {
+        images.add(clean);
       }
-    }
+    });
   }
 
-  // Metoda 2: Tag-uri <img> cu alicdn
-  const imgTagPattern = /src=["'](https:\/\/[^"']*alicdn\.com[^"']*\.(jpg|jpeg|png|webp))[^"']*/gi;
+  // Metoda 3: Cauta in tag-uri img
+  const imgSrcPattern = /src=["'](https:\/\/[^"']*alicdn\.com[^"']*)/gi;
   let m;
-  while ((m = imgTagPattern.exec(html)) !== null) {
-    images.add(m[1]);
+  while ((m = imgSrcPattern.exec(html)) !== null) {
+    images.add(m[1].split("?")[0]);
   }
 
-  return [...images].slice(0, 8);
+  // Filtreaza: pastreaza doar poze mari (nu icoane)
+  return [...images]
+    .filter(url => {
+      const lower = url.toLowerCase();
+      return !lower.includes("icon") &&
+             !lower.includes("logo") &&
+             !lower.includes("avatar") &&
+             !lower.includes("50x50") &&
+             !lower.includes("30x30") &&
+             lower.includes("alicdn.com");
+    })
+    .slice(0, 8);
 }
 
-// Extrage titlul si descrierea din AliExpress HTML
-function extractAliExpressText(html) {
+// Extrage titlu si pret
+function extractMeta(html) {
   let title = "";
-  let price = 0;
+  let priceUSD = 0;
 
-  // Titlu
   const titlePatterns = [
-    /<title[^>]*>([^<]+)<\/title>/i,
-    /"subject":"([^"]+)"/,
-    /"title":"([^"]+)"/,
-    /class="[^"]*product-title[^"]*"[^>]*>([^<]+)</i,
+    /<title[^>]*>([^<|]+)/i,
+    /"subject"\s*:\s*"([^"]{10,})"/,
+    /"title"\s*:\s*"([^"]{10,})"/,
+    /class="[^"]*product-title[^"]*"[^>]*>\s*([^<]+)/i,
   ];
+
   for (const p of titlePatterns) {
     const m = html.match(p);
-    if (m && m[1] && m[1].length > 5) {
-      title = m[1].replace(/ - AliExpress.*$/i, "").replace(/&amp;/g, "&").trim();
-      break;
+    if (m?.[1]?.trim().length > 5) {
+      title = m[1]
+        .replace(/\s*[-|]\s*AliExpress.*$/i, "")
+        .replace(/&amp;/g, "&")
+        .replace(/&#\d+;/g, "")
+        .trim();
+      if (title.length > 5) break;
     }
   }
 
-  // Pret
   const pricePatterns = [
-    /"price":"([0-9.]+)"/,
-    /"salePrice":{"value":"([0-9.]+)"/,
-    /US \$([0-9.]+)/,
+    /"discountPrice"\s*:\s*\{"value"\s*:\s*"([0-9.]+)"/,
+    /"salePrice"\s*:\s*\{"value"\s*:\s*"([0-9.]+)"/,
+    /"price"\s*:\s*"([0-9.]+)"/,
+    /US \$\s*([0-9.]+)/,
+    /\$\s*([0-9.]+)/,
   ];
+
   for (const p of pricePatterns) {
     const m = html.match(p);
-    if (m) { price = parseFloat(m[1]); break; }
+    if (m?.[1]) { priceUSD = parseFloat(m[1]); if (priceUSD > 0) break; }
   }
 
-  return { title, price };
+  return { title, priceUSD };
 }
 
-// Apeleaza Claude API pentru copywriting
-async function generateCopywriting(productInfo) {
+// Claude API pentru copywriting
+function generateCopy(productInfo) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error("ANTHROPIC_API_KEY nu e setat in Vercel Environment Variables");
 
+  const ronPrice = productInfo.priceUSD > 0
+    ? Math.round(productInfo.priceUSD * 5 * 2.5 / 10) * 10
+    : 149;
+
   const body = JSON.stringify({
-    model: "claude-opus-4-5",
+    model: "claude-sonnet-4-5",
     max_tokens: 2000,
     system: "Ești expert în marketing direct COD (cash on delivery) din România. Răspunzi DOAR cu JSON valid, fără backtick-uri, fără text în afara JSON-ului.",
     messages: [{
       role: "user",
-      content: `Creează conținut complet pentru o pagină de vânzare COD în România pentru acest produs:
+      content: `Creează conținut complet pentru o pagină de vânzare COD în România pentru:
 
-Titlu produs: ${productInfo.title}
+Titlu produs: ${productInfo.title || "Produs AliExpress"}
 Preț achiziție: ~${productInfo.priceUSD} USD
+Preț recomandat vânzare: ~${ronPrice} lei
 
 Returnează DOAR acest JSON:
 {
   "productName": "numele comercial scurt în română",
   "headline": "titlu captivant max 12 cuvinte cu beneficiul principal",
   "subheadline": "2 propoziții convingătoare despre produs",
-  "price": 149,
-  "oldPrice": 249,
-  "bumpPrice": 29,
+  "price": ${ronPrice},
+  "oldPrice": ${Math.round(ronPrice * 1.6)},
+  "bumpPrice": ${Math.round(ronPrice * 0.2)},
   "stock": 7,
   "timerMinutes": 14,
   "reviewCount": 1247,
-  "benefits": [
-    "beneficiu detaliat 1",
-    "beneficiu detaliat 2", 
-    "beneficiu detaliat 3",
-    "beneficiu detaliat 4",
-    "beneficiu detaliat 5",
-    "beneficiu detaliat 6"
-  ],
+  "benefits": ["beneficiu 1","beneficiu 2","beneficiu 3","beneficiu 4","beneficiu 5","beneficiu 6"],
   "howItWorks": [
-    {"title": "Pasul 1", "desc": "descriere"},
-    {"title": "Pasul 2", "desc": "descriere"},
-    {"title": "Pasul 3", "desc": "descriere"}
+    {"title":"Pasul 1","desc":"descriere"},
+    {"title":"Pasul 2","desc":"descriere"},
+    {"title":"Pasul 3","desc":"descriere"}
   ],
   "bumpProduct": "produs complementar scurt",
   "testimonials": [
-    {"text": "testimonial credibil detaliat", "name": "Prenume Nume", "city": "Oraș", "stars": 5},
-    {"text": "testimonial 2 cu rezultat specific", "name": "Prenume Nume", "city": "Oraș", "stars": 5},
-    {"text": "testimonial 3", "name": "Prenume Nume", "city": "Oraș", "stars": 5},
-    {"text": "testimonial 4", "name": "Prenume Nume", "city": "Oraș", "stars": 5}
+    {"text":"testimonial credibil detaliat","name":"Prenume Nume","city":"Oraș","stars":5},
+    {"text":"testimonial 2","name":"Prenume Nume","city":"Oraș","stars":5},
+    {"text":"testimonial 3","name":"Prenume Nume","city":"Oraș","stars":5},
+    {"text":"testimonial 4","name":"Prenume Nume","city":"Oraș","stars":5}
   ],
   "faq": [
-    {"q": "Întrebare specifică produsului?", "a": "Răspuns detaliat."},
-    {"q": "Cum se face plata?", "a": "Plata se face la livrare, direct curierului. Nu plătești nimic în avans."},
-    {"q": "Cât durează livrarea?", "a": "2–4 zile lucrătoare în toată România."},
-    {"q": "Pot returna produsul?", "a": "Da, 30 de zile retur gratuit."}
+    {"q":"Întrebare specifică produsului?","a":"Răspuns detaliat."},
+    {"q":"Cum se face plata?","a":"Plata se face la livrare, direct curierului. Nu plătești nimic în avans."},
+    {"q":"Cât durează livrarea?","a":"2–4 zile lucrătoare în toată România."},
+    {"q":"Pot returna produsul?","a":"Da, 30 de zile retur gratuit."}
   ]
 }`
     }]
@@ -200,11 +233,12 @@ Returnează DOAR acest JSON:
       res.on("end", () => {
         try {
           const data = JSON.parse(Buffer.concat(chunks).toString());
+          if (data.error) throw new Error(data.error.message);
           const text = (data.content || []).map(c => c.text || "").join("");
           const match = text.match(/\{[\s\S]*\}/);
-          if (!match) throw new Error("No JSON in Claude response");
+          if (!match) throw new Error("No JSON in response");
           resolve(JSON.parse(match[0]));
-        } catch (e) { reject(e); }
+        } catch(e) { reject(e); }
       });
     });
     req.on("error", reject);
@@ -213,49 +247,59 @@ Returnează DOAR acest JSON:
   });
 }
 
-// ── MAIN HANDLER ──
+// MAIN HANDLER
 module.exports = async function handler(req, res) {
-  // CORS - permite orice origine
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    const { aliUrl, productName } = req.body;
+    const { aliUrl } = req.body;
+    if (!aliUrl) return res.status(400).json({ error: "aliUrl lipsește" });
 
     let images = [];
-    let productInfo = { title: productName || "", priceUSD: 0 };
+    let productInfo = { title: "", priceUSD: 0 };
 
-    // ── SCRAPE ALIEXPRESS daca avem link
-    if (aliUrl && aliUrl.includes("aliexpress.com")) {
-      console.log("Scraping AliExpress:", aliUrl);
+    // Incearca mai multe URL-uri AliExpress (mobile e mai usor de scrapat)
+    const urlsToTry = [
+      aliUrl,
+      aliUrl.replace("www.aliexpress.com", "m.aliexpress.com"),
+      aliUrl.replace("www.aliexpress.com/item/", "www.aliexpress.com/i/"),
+    ];
+
+    let html = "";
+    for (const url of urlsToTry) {
       try {
-        const html = await fetchUrl(aliUrl);
-        images = extractAliExpressImages(html);
-        const extracted = extractAliExpressText(html);
-        if (extracted.title) productInfo.title = extracted.title;
-        if (extracted.price) productInfo.priceUSD = extracted.price;
-        console.log(`Extracted ${images.length} images, title: ${productInfo.title}`);
-      } catch (scrapeErr) {
-        console.error("Scrape error:", scrapeErr.message);
-        // Continua fara poze daca scraping esueaza
+        console.log("Trying:", url);
+        html = await fetchUrl(url);
+        if (html.length > 5000) {
+          console.log("Got HTML, length:", html.length);
+          break;
+        }
+      } catch(e) {
+        console.log("Failed:", url, e.message);
       }
     }
 
-    // ── GENEREAZA COPYWRITING cu Claude
-    const copy = await generateCopywriting(productInfo);
+    if (html.length > 1000) {
+      images = extractImages(html);
+      const meta = extractMeta(html);
+      productInfo = meta;
+      console.log(`Extracted ${images.length} images, title: "${meta.title}", price: $${meta.priceUSD}`);
+    } else {
+      console.log("Could not fetch AliExpress page, HTML too short:", html.length);
+    }
 
-    // ── COMBINA: poze reale + copy generat
-    copy.images = images.length > 0 ? images : [];
-    copy.aliUrl = aliUrl || null;
+    // Genereaza copywriting cu Claude
+    const copy = await generateCopy(productInfo);
+    copy.images = images;
 
     res.status(200).json({ success: true, data: copy });
 
-  } catch (err) {
-    console.error("Handler error:", err);
+  } catch(err) {
+    console.error("Error:", err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 };
